@@ -1700,6 +1700,13 @@ CreateThread(function()
                         TriggerServerEvent('corex-zombies:server:sharedZombieDied', zombieData.sharedBatchId, zombieData.sharedId)
                     end
                     TriggerEvent('corex:client:zombieKill')
+
+                    -- corex-skills XP relay: only credit when the local player
+                    -- actually got the kill (skip ambient/environmental deaths).
+                    local killer = GetPedSourceOfDeath(zombieData.entity)
+                    if killer == PlayerPedId() then
+                        TriggerServerEvent('corex-skills:server:reportZombieKill', zombieData.typeId)
+                    end
                 end
 
                 if GetGameTimer() - zombieData.deathTime > Config.Cleanup.corpseLifetime then
