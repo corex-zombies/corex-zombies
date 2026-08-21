@@ -60,6 +60,7 @@ local loadedClipsets = {}
 
 local isGrabbed = false
 local grabbingZombie = nil
+local grabSession = nil
 local grabDamageTimer = 0
 local escapeProgress = 0
 local lastEscapePress = 0
@@ -1250,6 +1251,9 @@ local function CanGrabPlayer(zombieEntity)
     local grabConfig = GetGrabConfig()
     if not grabConfig.enabled then return false end
     if isGrabbed then return false end
+    if not DoesEntityExist(zombieEntity) or IsPedDeadOrDying(zombieEntity, true) then return false end
+    local playerPed = Corex.Functions.GetPed()
+    if not playerPed or playerPed == 0 or IsPedDeadOrDying(playerPed, true) then return false end
     if grabCooldown[zombieEntity] and GetGameTimer() < grabCooldown[zombieEntity] then return false end
     return true
 end
@@ -1257,23 +1261,74 @@ end
 local function StartGrab(zombieEntity)
     if not CanGrabPlayer(zombieEntity) then return end
 
-    isGrabbed = true
-    grabbingZombie = zombieEntity
-    escapeProgress = 0
-    grabDamageTimer = GetGameTimer()
+    local grabConfig = GetGrabConfig()
+    if not ZX.GrabRuntime.AcquireControl(zombieEntity, grabConfig.controlTimeout or 750) then
+        grabCooldown[zombieEntity] = GetGameTimer() + 1500
+        return
+    end
 
     local playerPed = Corex.Functions.GetPed()
-    ClearPedTasks(zombieEntity)
+    local animDict = grabConfig.animDict or 'anim@gangops@hostage@'
+    if not RequestAnimDictSafe(animDict) then
+        grabCooldown[zombieEntity] = GetGameTimer() + 1500
+        return
+    end
+
+    ClearPedTasksImmediately(zombieEntity)
     ClearPedTasksImmediately(playerPed)
 
     local zombieCoords = GetEntityCoords(zombieEntity)
     local playerCoords = Corex.Functions.GetCoords()
-    local heading = GetHeadingFromVector_2d(playerCoords.x - zombieCoords.x, playerCoords.y - zombieCoords.y)
+    local heading = GetHeadingFromVector_2d(
+        playerCoords.x - zombieCoords.x,
+        playerCoords.y - zombieCoords.y
+    )
     SetEntityHeading(zombieEntity, heading)
+    SetEntityCoordsNoOffset(
+        playerPed, zombieCoords.x, zombieCoords.y, zombieCoords.z, false, false, false
+    )
+    SetEntityHeading(playerPed, heading)
 
-    RequestAnimDictSafe('melee@unarmed@streamed_core_fps')
-    TaskPlayAnim(zombieEntity, 'melee@unarmed@streamed_core_fps', 'ground_attack_on_top', 3.0, -3.0, -1, 49, 0, false, false, false)
-    FreezeEntityPosition(playerPed, true)
+    local started, scene = pcall(function()
+        local synchronizedScene = NetworkCreateSynchronisedScene(
+            zombieCoords.x,
+            zombieCoords.y,
+            zombieCoords.z,
+            0.0,
+            0.0,
+            heading,
+            2,
+            false,
+            true,
+            1.0,
+            0.0,
+            1.0
+        )
+        NetworkAddPedToSynchronisedScene(
+            zombieEntity, synchronizedScene, animDict,
+            grabConfig.zombieAnim or 'perp_idle',
+            4.0, -4.0, -1, 1, 1.0, 0
+        )
+        NetworkAddPedToSynchronisedScene(
+            playerPed, synchronizedScene, animDict,
+            grabConfig.playerAnim or 'victim_idle',
+            4.0, -4.0, -1, 1, 1.0, 0
+        )
+        NetworkStartSynchronisedScene(synchronizedScene)
+        return synchronizedScene
+    end)
+
+    if not started or not scene then
+        ZX.GrabRuntime.Cleanup({ player = playerPed, zombie = zombieEntity })
+        grabCooldown[zombieEntity] = GetGameTimer() + 1500
+        return
+    end
+
+    isGrabbed = true
+    grabbingZombie = zombieEntity
+    grabSession = { player = playerPed, zombie = zombieEntity, scene = scene }
+    escapeProgress = 0
+    grabDamageTimer = GetGameTimer()
 
     -- Grab shriek — audible, telegraphs grab so bystanders react.
     if ZX.Audio and ZX.Audio.PlayGrabShriek then
@@ -1285,16 +1340,18 @@ local function EndGrab(escaped)
     if not isGrabbed then return end
     local grabConfig = GetGrabConfig()
     local playerPed = Corex.Functions.GetPed()
+    local releasedZombie = grabbingZombie
 
-    FreezeEntityPosition(playerPed, false)
-    ClearPedTasksImmediately(playerPed)
+    ZX.GrabRuntime.Cleanup(grabSession or {
+        player = playerPed,
+        zombie = releasedZombie
+    })
 
-    if DoesEntityExist(grabbingZombie) then
-        ClearPedTasks(grabbingZombie)
-        grabCooldown[grabbingZombie] = GetGameTimer() + grabConfig.grabCooldownTime
+    if DoesEntityExist(releasedZombie) then
+        grabCooldown[releasedZombie] = GetGameTimer() + grabConfig.grabCooldownTime
 
         for _, zd in ipairs(activeZombies) do
-            if zd.entity == grabbingZombie then
+            if zd.entity == releasedZombie then
                 if ZX.Combat then ZX.Combat.Reset(zd) end
                 break
             end
@@ -1308,13 +1365,14 @@ local function EndGrab(escaped)
             local pushZ = playerCoords.z
             local found, gz = GetGroundZFor_3dCoord(pushX, pushY, pushZ + 20.0, false)
             if found then pushZ = gz end
-            SetEntityCoords(grabbingZombie, pushX, pushY, pushZ, false, false, false, false)
-            SetPedToRagdoll(grabbingZombie, 1500, 1500, 0, false, false, false)
+            SetEntityCoords(releasedZombie, pushX, pushY, pushZ, false, false, false, false)
+            SetPedToRagdoll(releasedZombie, 1500, 1500, 0, false, false, false)
         end
     end
 
     isGrabbed = false
     grabbingZombie = nil
+    grabSession = nil
     escapeProgress = 0
 end
 
@@ -1335,6 +1393,10 @@ end
 
 local function ApplyGrabDamage()
     if not isGrabbed then return end
+    if not ZX.GrabRuntime.CanContinue(grabSession) then
+        EndGrab(false)
+        return
+    end
     local grabConfig = GetGrabConfig()
     local currentTime = GetGameTimer()
     if currentTime - grabDamageTimer >= grabConfig.grabDamageInterval then
@@ -1728,7 +1790,7 @@ CreateThread(function()
         if not grabConfig.enabled then goto continue end
 
         if isGrabbed then
-            if not DoesEntityExist(grabbingZombie) or IsPedDeadOrDying(grabbingZombie, true) then
+            if not ZX.GrabRuntime.CanContinue(grabSession) then
                 EndGrab(false)
             end
             goto continue

@@ -11,6 +11,7 @@ shared_scripts {
 }
 
 client_scripts {
+    'client/grab.lua',
     'client/horde.lua',
     'client/audio.lua',
     'client/effects.lua',
