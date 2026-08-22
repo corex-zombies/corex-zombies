@@ -682,19 +682,9 @@ local function SpawnZombie(forcedCoords, forcedType, spawnOptions)
         return nil
     end
 
-    local forceNetworked = spawnOptions.forceNetworked == true
-    local networked = forceNetworked
-
-    if not forceNetworked then
-        local networkedCount = 0
-        for _, zd in ipairs(activeZombies) do
-            if not zd.isDead and DoesEntityExist(zd.entity) and NetworkGetEntityIsNetworked(zd.entity) then
-                networkedCount = networkedCount + 1
-            end
-        end
-        local maxNetworked = 14
-        networked = networkedCount < maxNetworked
-    end
+    -- Ambient population is intentionally local. Only explicitly shared event
+    -- batches are networked, avoiding entity-owner churn for every player.
+    local networked = ZX.Population.ShouldNetwork(spawnOptions)
     local zombie = CreatePed(4, modelHash, coords.x, coords.y, coords.z, math.random(0, 360), networked, networked)
     if not DoesEntityExist(zombie) then
         DLog(('Spawn FAILED — CreatePed failed for %s'):format(modelName))
@@ -782,6 +772,7 @@ local function SpawnZombie(forcedCoords, forcedType, spawnOptions)
         currentDict      = nil,
         isSpawning       = isSpawning,
         spawnAnimEnd     = spawnAnimEnd,
+        nextAiAt         = now,
         sharedId         = spawnOptions.sharedId,
         sharedBatchId    = spawnOptions.sharedBatchId,
         isSharedOwned    = spawnOptions.sharedId ~= nil,
@@ -1613,7 +1604,7 @@ CreateThread(function()
 
     while true do
         Wait(Config.Spawning.spawnInterval or 5000)
-        if not Config.Spawning.enabled then goto continue end
+        if not ZX.Population.AmbientEnabled(Config) then goto continue end
 
         local playerCoords = Corex.Functions.GetCoords()
         if IsInsideSharedSuppressionZone(playerCoords) then
@@ -1634,6 +1625,7 @@ CreateThread(function()
                             TaskGoStraightToCoord(zombie, data.target.x, data.target.y, data.target.z, 1.0, -1, 0.0, 0.0)
                             SetPedKeepTask(zombie, true)
                             currentCount = currentCount + 1
+                            Wait((Config.Performance and Config.Performance.spawnStaggerMs) or 75)
                         end
                     end
                 end
@@ -1643,7 +1635,10 @@ CreateThread(function()
         if currentCount < dynamicBudget then
             local spawnCount = math.min(Config.Spawning.maxZombiesPerSpawn, dynamicBudget - currentCount)
             for _ = 1, spawnCount do
-                SpawnZombie()
+                local zombie = SpawnZombie()
+                if zombie and DoesEntityExist(zombie) then
+                    Wait((Config.Performance and Config.Performance.spawnStaggerMs) or 75)
+                end
             end
         end
 
@@ -1655,13 +1650,21 @@ CreateThread(function()
     while not isReady do Wait(500) end
 
     while true do
-        Wait(50)
+        Wait((Config.Performance and Config.Performance.runnerInterval) or 100)
         local playerPed = Corex.Functions.GetPed()
         if not playerPed or playerPed == 0 or IsPedDeadOrDying(playerPed, true) then goto runnerContinue end
         local playerCoords = Corex.Functions.GetCoords()
 
         for _, z in ipairs(activeZombies) do
             if not z.isDead and z.typeData and z.typeData.id == 'runner' and DoesEntityExist(z.entity) and not z.isSpawning then
+                local zc = GetEntityCoords(z.entity)
+                local dx = playerCoords.x - zc.x
+                local dy = playerCoords.y - zc.y
+                local d = math.sqrt(dx * dx + dy * dy)
+                if not ZX.Population.RunnerActive(d, Config.Performance) then
+                    goto continueRunner
+                end
+
                 UpdateZombieDamageState(z, z.entity)
 
                 if IsZombieMovementBlocked(z.entity) then
@@ -1671,10 +1674,6 @@ CreateThread(function()
 
                 local phase = z.attackPhase
                 if phase == 'none' then
-                    local zc = GetEntityCoords(z.entity)
-                    local dx = playerCoords.x - zc.x
-                    local dy = playerCoords.y - zc.y
-                    local d = math.sqrt(dx * dx + dy * dy)
                     if d > 2.5 then
                         local force = 6.0
                         local vz = GetEntityVelocity(z.entity)
@@ -1694,7 +1693,7 @@ CreateThread(function()
     while not isReady do Wait(500) end
 
     while true do
-        Wait(200)
+        Wait(100)
 
         local playerPed = Corex.Functions.GetPed()
         local playerCoords = Corex.Functions.GetCoords()
@@ -1703,7 +1702,11 @@ CreateThread(function()
 
         for _, zombieData in ipairs(activeZombies) do
             if DoesEntityExist(zombieData.entity) and not zombieData.isDead then
-                UpdateZombieAI(zombieData, playerPed, playerCoords, now, playerCache)
+                local distance = GetDistance(GetEntityCoords(zombieData.entity), playerCoords)
+                if now >= (zombieData.nextAiAt or 0) then
+                    zombieData.nextAiAt = now + ZX.Population.AiInterval(distance, Config.Performance)
+                    UpdateZombieAI(zombieData, playerPed, playerCoords, now, playerCache)
+                end
             end
         end
 

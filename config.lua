@@ -85,6 +85,17 @@ Config.Spawning = {
     maxZombiesPerSpawn = 3
 }
 
+Config.Performance = {
+    nearDistance = 35.0,
+    midDistance = 80.0,
+    aiNearInterval = 200,
+    aiMidInterval = 500,
+    aiFarInterval = 1000,
+    runnerMaxDistance = 55.0,
+    runnerInterval = 100,
+    spawnStaggerMs = 75
+}
+
 Config.SafeZoneBuffer = 30.0
 Config.DespawnDistance = 120.0
 
